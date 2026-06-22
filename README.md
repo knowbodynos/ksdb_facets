@@ -49,6 +49,7 @@ uv run python run_cone_nf.py --limit 1000 \
 | `--batch-size N` | `10000` | Rows loaded into memory per iteration |
 | `--chunk-size N` | `500` | Rows per worker subprocess call |
 | `--limit N` | — | Stop after N rows (for testing) |
+| `--s3-uri URI` | — | Upload output to S3 then shut down the instance (EC2 spot use) |
 
 ### Binary directly
 

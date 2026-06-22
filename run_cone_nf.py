@@ -152,6 +152,19 @@ def process_batch(global_indices, verts_list, bin_path, n_workers, chunk_size):
     )
 
 
+def upload_to_s3(local_path: str, s3_uri: str) -> None:
+    if not s3_uri.startswith("s3://"):
+        raise ValueError("s3_uri must start with s3://")
+    bucket, key = s3_uri[5:].split("/", 1)
+    import boto3
+    boto3.client("s3").upload_file(local_path, bucket, key)
+
+
+def terminate_instance() -> None:
+    # Requires instance role permission: ec2:TerminateInstances
+    subprocess.run(["sudo", "shutdown", "-h", "now"], check=False)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -175,6 +188,8 @@ def main():
                     help="Rows per worker subprocess call")
     ap.add_argument("--limit",      type=int, default=None,
                     help="Only process the first N rows (for testing)")
+    ap.add_argument("--s3-uri",      type=str, default=None,
+                    help="Upload output to this S3 URI then shut down the instance")
     args = ap.parse_args()
 
     bin_path = Path(args.bin)
@@ -218,6 +233,13 @@ def main():
 
     writer.close()
     print(f"\nWrote {n_written:,} rows → {out_path}", flush=True)
+
+    if args.s3_uri is not None:
+        try:
+            upload_to_s3(str(out_path), args.s3_uri)
+            print(f"Uploaded {out_path} to {args.s3_uri}")
+        finally:
+            terminate_instance()
 
 
 if __name__ == "__main__":

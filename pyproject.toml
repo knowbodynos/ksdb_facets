@@ -5,6 +5,7 @@ description = "Compute unique facets of Kreuzer-Skarke 4D polytopes"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "boto3>=1.43.34",
     "ipykernel>=7.3.0",
     "ipywidgets>=8.1.8",
     "numpy>=2.5.0",
