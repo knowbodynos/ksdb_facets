@@ -1,0 +1,15 @@
+[project]
+name = "ksdb-facets"
+version = "0.1.0"
+description = "Compute unique facets of Kreuzer-Skarke 4D polytopes"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.8",
+    "numpy>=2.5.0",
+    "pandas>=3.0.3",
+    "polars>=1.41.2",
+    "pyarrow>=24.0.0",
+    "tqdm>=4.68.3",
+]
