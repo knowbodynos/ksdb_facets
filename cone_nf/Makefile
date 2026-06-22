@@ -1,5 +1,5 @@
 CXX      = g++
-CXXFLAGS = -std=c++11 -O2 -I../modules/facets/code
+CXXFLAGS = -std=c++11 -O2
 
 cone_nf: cone_nf.cpp
 	$(CXX) $(CXXFLAGS) cone_nf.cpp -o cone_nf

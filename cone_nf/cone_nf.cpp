@@ -8,7 +8,7 @@
   facets module).  No Eigen, no RapidJSON, no MongoDB.
 
   Build:
-    g++ -std=c++11 -O2 -I../modules/facets/code cone_nf.cpp -o cone_nf
+    g++ -std=c++11 -O2 cone_nf.cpp -o cone_nf
 
   Usage (one JSON object per stdin line):
     echo '{"verts":[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1],[-1,-1,-1,-1]]}' \
