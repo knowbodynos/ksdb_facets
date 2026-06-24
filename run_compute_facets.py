@@ -31,7 +31,7 @@ Examples:
     # Quick test on first 1000 rows
     uv run python run_compute_facets.py --limit 1000 \
         "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \
-        facet_results.parquet
+        facet_results_test.parquet
 """
 
 import argparse
