@@ -35,9 +35,11 @@ Examples:
 """
 
 import argparse
+import datetime
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -66,23 +68,49 @@ class WorkerPool:
     thread sends rows one at a time and reads responses without restarting the
     process between chunks.
     """
-    def __init__(self, bin_path: str, n_workers: int):
-        self._task_q   = queue.Queue()
+    def __init__(self, bin_path: str, n_workers: int, log_path: str = None):
+        self._task_q   = queue.Queue(maxsize=n_workers * 4)
         self._result_q = queue.Queue()
+        self._log_lock = threading.Lock()
+        self._log_file = open(log_path, 'a') if log_path else None
         self._threads  = []
         for _ in range(n_workers):
             t = threading.Thread(target=self._run, args=(bin_path,), daemon=True)
             t.start()
             self._threads.append(t)
 
-    def _run(self, bin_path: str):
-        proc = subprocess.Popen(
+    def _warn(self, msg: str):
+        print(f"\n  [warn] {msg}", file=sys.stderr)
+        if self._log_file is not None:
+            with self._log_lock:
+                self._log_file.write(f"{datetime.datetime.now().isoformat()} [warn] {msg}\n")
+                self._log_file.flush()
+
+    @staticmethod
+    def _exit_str(returncode: int) -> str:
+        if returncode >= 0:
+            return f"exit {returncode}"
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        s = f"killed by {name}"
+        if name == "SIGKILL":
+            s += " (possible OOM — check: dmesg | grep -i 'killed process')"
+        return s
+
+    @staticmethod
+    def _start_proc(bin_path: str):
+        return subprocess.Popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
+
+    def _run(self, bin_path: str):
+        proc = self._start_proc(bin_path)
         while True:
             item = self._task_q.get()
             if item is None:
@@ -97,8 +125,19 @@ class WorkerPool:
                 line = proc.stdout.readline().strip()
                 if line:
                     self._result_q.put(json.loads(line))
+                elif proc.poll() is not None:
+                    stderr_out = proc.stderr.read().strip()
+                    self._warn(f"worker crashed on index {idx} ({self._exit_str(proc.returncode)})"
+                               + (f": {stderr_out}" if stderr_out else ""))
+                    proc = self._start_proc(bin_path)
+            except BrokenPipeError:
+                proc.wait()
+                stderr_out = proc.stderr.read().strip()
+                self._warn(f"broken pipe on index {idx} ({self._exit_str(proc.returncode)})"
+                           + (f": {stderr_out}" if stderr_out else ""))
+                proc = self._start_proc(bin_path)
             except Exception as exc:
-                print(f"\n  [warn] worker error: {exc}", file=sys.stderr)
+                self._warn(f"worker error on index {idx}: {exc}")
             self._task_q.task_done()
         proc.stdin.close()
         proc.wait()
@@ -119,6 +158,8 @@ class WorkerPool:
             self._task_q.put(None)
         for t in self._threads:
             t.join()
+        if self._log_file is not None:
+            self._log_file.close()
 
     def __enter__(self):
         return self
@@ -224,6 +265,8 @@ def main():
                     help="Only process the first N rows (for testing)")
     ap.add_argument("--s3-uri",      type=str, default=None,
                     help="Upload output to this S3 URI then shut down the instance")
+    ap.add_argument("--log",         type=str, default=None,
+                    help="Append worker warnings to this file")
     args = ap.parse_args()
 
     bin_path = Path(args.bin)
@@ -246,7 +289,7 @@ def main():
     writer = pq.ParquetWriter(str(out_path), OUT_SCHEMA, compression="snappy")
 
     n_written = 0
-    with WorkerPool(str(bin_path), args.workers) as pool:
+    with WorkerPool(str(bin_path), args.workers, log_path=args.log) as pool:
         with tqdm(total=total, unit="poly", smoothing=0.05) as bar:
             offset = 0
             while offset < total:
