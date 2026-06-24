@@ -37,9 +37,10 @@ Examples:
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import threading
 from pathlib import Path
 
 import polars as pl
@@ -52,42 +53,78 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 DEFAULT_BIN        = Path(__file__).resolve().parent / "compute_facets" / "compute_facets"
 DEFAULT_BATCH_SIZE = 10_000   # rows read into memory per iteration
-DEFAULT_CHUNK_SIZE = 500      # rows sent to one compute_facets subprocess
 DEFAULT_WORKERS    = os.cpu_count() or 4
 
 # ---------------------------------------------------------------------------
-# Worker (serialisable: runs inside ProcessPoolExecutor)
+# Persistent worker pool
 # ---------------------------------------------------------------------------
 
-def _worker(args):
+class WorkerPool:
     """
-    Pipe one sub-chunk through compute_facets.
-    args = ([(global_idx, verts), ...], bin_path_str)
-    Returns list of parsed JSON result dicts.
+    N persistent compute_facets subprocesses, each owned by one thread.
+    The binary speaks line-by-line JSON (one row in → one row out), so each
+    thread sends rows one at a time and reads responses without restarting the
+    process between chunks.
     """
-    rows, bin_path = args
-    lines = [
-        json.dumps({"index": idx, "verts": verts}, separators=(',', ':'))
-        for idx, verts in rows
-    ]
-    proc = subprocess.Popen(
-        [bin_path],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, _ = proc.communicate('\n'.join(lines))
-    results = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            results.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-    return results
+    def __init__(self, bin_path: str, n_workers: int):
+        self._task_q   = queue.Queue()
+        self._result_q = queue.Queue()
+        self._threads  = []
+        for _ in range(n_workers):
+            t = threading.Thread(target=self._run, args=(bin_path,), daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _run(self, bin_path: str):
+        proc = subprocess.Popen(
+            [bin_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        while True:
+            item = self._task_q.get()
+            if item is None:
+                self._task_q.task_done()
+                break
+            idx, verts = item
+            try:
+                proc.stdin.write(
+                    json.dumps({"index": idx, "verts": verts}, separators=(',', ':')) + '\n'
+                )
+                proc.stdin.flush()
+                line = proc.stdout.readline().strip()
+                if line:
+                    self._result_q.put(json.loads(line))
+            except Exception as exc:
+                print(f"\n  [warn] worker error: {exc}", file=sys.stderr)
+            self._task_q.task_done()
+        proc.stdin.close()
+        proc.wait()
+
+    def submit(self, idx: int, verts) -> None:
+        self._task_q.put((idx, verts))
+
+    def join(self) -> list:
+        """Block until all submitted tasks finish; return collected results."""
+        self._task_q.join()
+        results = []
+        while not self._result_q.empty():
+            results.append(self._result_q.get_nowait())
+        return results
+
+    def close(self):
+        for _ in self._threads:
+            self._task_q.put(None)
+        for t in self._threads:
+            t.join()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -108,27 +145,16 @@ OUT_SCHEMA = pa.schema([
 # Process one in-memory batch
 # ---------------------------------------------------------------------------
 
-def process_batch(global_indices, verts_list, bin_path, n_workers, chunk_size):
+def process_batch(pool, global_indices, verts_list):
     """
     global_indices : list of int  (source parquet row indices)
     verts_list     : list of list-of-list-of-int
     Returns a pyarrow RecordBatch (or None if empty).
     """
-    rows = list(zip(global_indices, verts_list))
-    chunks = [
-        (rows[i:i + chunk_size], str(bin_path))
-        for i in range(0, len(rows), chunk_size)
-    ]
+    for idx, verts in zip(global_indices, verts_list):
+        pool.submit(idx, verts)
 
-    all_results = []
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futs = [pool.submit(_worker, c) for c in chunks]
-        for fut in as_completed(futs):
-            try:
-                all_results.extend(fut.result())
-            except Exception as exc:
-                print(f"\n  [warn] worker error: {exc}", file=sys.stderr)
-
+    all_results = pool.join()
     if not all_results:
         return None
 
@@ -194,8 +220,6 @@ def main():
                     help="Number of parallel worker processes")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                     help="Rows loaded into memory per iteration")
-    ap.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
-                    help="Rows per worker subprocess call")
     ap.add_argument("--limit",      type=int, default=None,
                     help="Only process the first N rows (for testing)")
     ap.add_argument("--s3-uri",      type=str, default=None,
@@ -214,7 +238,7 @@ def main():
     if args.limit:
         total = min(total, args.limit)
     print(f"  {total:,} rows to process  |  {args.workers} workers  |  "
-          f"batch={args.batch_size}  chunk={args.chunk_size}", flush=True)
+          f"batch={args.batch_size}", flush=True)
 
     # --- Streaming write ---
     out_path = Path(args.output)
@@ -222,24 +246,22 @@ def main():
     writer = pq.ParquetWriter(str(out_path), OUT_SCHEMA, compression="snappy")
 
     n_written = 0
-    with tqdm(total=total, unit="poly", smoothing=0.05) as bar:
-        offset = 0
-        while offset < total:
-            batch_n = min(args.batch_size, total - offset)
-            df = lf.slice(offset, batch_n).collect()
-            global_indices = list(range(offset, offset + len(df)))
-            verts_list = df[args.verts_col].to_list()
+    with WorkerPool(str(bin_path), args.workers) as pool:
+        with tqdm(total=total, unit="poly", smoothing=0.05) as bar:
+            offset = 0
+            while offset < total:
+                batch_n = min(args.batch_size, total - offset)
+                df = lf.slice(offset, batch_n).collect()
+                global_indices = list(range(offset, offset + len(df)))
+                verts_list = df[args.verts_col].to_list()
 
-            rb = process_batch(
-                global_indices, verts_list,
-                bin_path, args.workers, args.chunk_size,
-            )
-            if rb is not None:
-                writer.write_batch(rb)
-                n_written += rb.num_rows
+                rb = process_batch(pool, global_indices, verts_list)
+                if rb is not None:
+                    writer.write_batch(rb)
+                    n_written += rb.num_rows
 
-            bar.update(len(df))
-            offset += len(df)
+                bar.update(len(df))
+                offset += len(df)
 
     writer.close()
     print(f"\nWrote {n_written:,} rows → {out_path}", flush=True)
