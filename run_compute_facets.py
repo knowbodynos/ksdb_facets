@@ -1,31 +1,37 @@
 #!/usr/bin/env python3
 """
-run_cone_nf.py
+run_compute_facets.py
 --------------
-Run cone_nf on every row of a parquet file and write results to a new parquet.
+Run compute_facets on every row of a parquet file and write results to a new parquet.
 
 For each polytope the output contains:
-  idx            – original row index in the source parquet
-  vertices       – original List(List(Int32)) vertices (pass-through)
-  cone_nfs       – List(List(List(Int32))): one NF vertex matrix per unique cone type
-  multiplicities – List(Int32): how many facets share each cone NF (parallel to cone_nfs)
+  index            – original row index in the source parquet (pass-through)
+  verts            – List(List(Int32)): original 4D polytope vertices
+  dual_verts       – List(List(Int32)): vertices of the dual polytope (facet normals);
+                     dual_verts[i] is the inner normal of facets[i] (inner product == -1)
+  facets           – List(List(List(Int32))): 3D facets in dual-vertex order;
+                     facets[i] corresponds 1:1 to dual_verts[i]
+  facet_nfs        – List(List(List(Int32))): GL(3,Z) normal form of each 3D facet;
+                     canonical invariant of the facet as an abstract 3D lattice polytope
+  maximal_cone_nfs – List(List(List(Int32))): GL(4,Z) normal form of conv(facets[i] ∪ {0});
+                     finer invariant capturing the embedding of the facet in Z^4
 
 Usage:
-    uv run python run_cone_nf.py INPUT OUTPUT [options]
+    uv run python run_compute_facets.py INPUT OUTPUT [options]
 
     INPUT   parquet path, glob, or hf:// URL
     OUTPUT  output parquet path
 
 Examples:
     # Full dataset
-    uv run python run_cone_nf.py \
+    uv run python run_compute_facets.py \
         "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \
-        cone_nf_results.parquet
+        facet_results.parquet
 
     # Quick test on first 1000 rows
-    uv run python run_cone_nf.py --limit 1000 \
+    uv run python run_compute_facets.py --limit 1000 \
         "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \
-        cone_nf_test.parquet
+        facet_results.parquet
 """
 
 import argparse
@@ -44,9 +50,9 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_BIN        = Path(__file__).resolve().parent / "cone_nf" / "cone_nf"
+DEFAULT_BIN        = Path(__file__).resolve().parent / "compute_facets" / "compute_facets"
 DEFAULT_BATCH_SIZE = 10_000   # rows read into memory per iteration
-DEFAULT_CHUNK_SIZE = 500      # rows sent to one cone_nf subprocess
+DEFAULT_CHUNK_SIZE = 500      # rows sent to one compute_facets subprocess
 DEFAULT_WORKERS    = os.cpu_count() or 4
 
 # ---------------------------------------------------------------------------
@@ -55,13 +61,13 @@ DEFAULT_WORKERS    = os.cpu_count() or 4
 
 def _worker(args):
     """
-    Pipe one sub-chunk through cone_nf.
+    Pipe one sub-chunk through compute_facets.
     args = ([(global_idx, verts), ...], bin_path_str)
     Returns list of parsed JSON result dicts.
     """
     rows, bin_path = args
     lines = [
-        json.dumps({"POLYID": idx, "verts": verts}, separators=(',', ':'))
+        json.dumps({"index": idx, "verts": verts}, separators=(',', ':'))
         for idx, verts in rows
     ]
     proc = subprocess.Popen(
@@ -89,10 +95,12 @@ def _worker(args):
 # ---------------------------------------------------------------------------
 
 OUT_SCHEMA = pa.schema([
-    pa.field("idx",            pa.int64()),
-    pa.field("vertices",       pa.list_(pa.list_(pa.int32()))),
-    pa.field("cone_nfs",       pa.list_(pa.list_(pa.list_(pa.int32())))),
-    pa.field("multiplicities", pa.list_(pa.int32())),
+    pa.field("index",            pa.int64()),
+    pa.field("verts",            pa.list_(pa.list_(pa.int32()))),
+    pa.field("dual_verts",       pa.list_(pa.list_(pa.int32()))),
+    pa.field("facets",           pa.list_(pa.list_(pa.list_(pa.int32())))),
+    pa.field("facet_nfs",        pa.list_(pa.list_(pa.list_(pa.int32())))),
+    pa.field("maximal_cone_nfs", pa.list_(pa.list_(pa.list_(pa.int32())))),
 ])
 
 
@@ -124,29 +132,31 @@ def process_batch(global_indices, verts_list, bin_path, n_workers, chunk_size):
     if not all_results:
         return None
 
-    all_results.sort(key=lambda r: r["POLYID"])
+    all_results.sort(key=lambda r: r["index"])
 
-    # Build a lookup from global_idx → original verts
-    verts_by_idx = dict(rows)
-
-    out_idx   = []
-    out_verts = []
-    out_nfs   = []   # List[List[List[int]]]  — one NF matrix per unique cone
-    out_mults = []   # List[int]              — multiplicity per unique cone
+    out_index        = []
+    out_verts        = []
+    out_dual_verts   = []
+    out_facets       = []
+    out_facet_nfs    = []
+    out_maxcone_nfs  = []
 
     for r in all_results:
-        gidx = r["POLYID"]
-        out_idx.append(gidx)
-        out_verts.append(verts_by_idx[gidx])
-        out_nfs.append([u["cone_nf"]      for u in r["unique_cones"]])
-        out_mults.append([u["multiplicity"] for u in r["unique_cones"]])
+        out_index.append(r["index"])
+        out_verts.append(r["verts"])
+        out_dual_verts.append(r["dual_verts"])
+        out_facets.append(r["facets"])
+        out_facet_nfs.append(r["facet_nfs"])
+        out_maxcone_nfs.append(r["maximal_cone_nfs"])
 
     return pa.record_batch(
         [
-            pa.array(out_idx,   type=pa.int64()),
-            pa.array(out_verts, type=pa.list_(pa.list_(pa.int32()))),
-            pa.array(out_nfs,   type=pa.list_(pa.list_(pa.list_(pa.int32())))),
-            pa.array(out_mults, type=pa.list_(pa.int32())),
+            pa.array(out_index,       type=pa.int64()),
+            pa.array(out_verts,       type=pa.list_(pa.list_(pa.int32()))),
+            pa.array(out_dual_verts,  type=pa.list_(pa.list_(pa.int32()))),
+            pa.array(out_facets,      type=pa.list_(pa.list_(pa.list_(pa.int32())))),
+            pa.array(out_facet_nfs,   type=pa.list_(pa.list_(pa.list_(pa.int32())))),
+            pa.array(out_maxcone_nfs, type=pa.list_(pa.list_(pa.list_(pa.int32())))),
         ],
         schema=OUT_SCHEMA,
     )
@@ -171,7 +181,7 @@ def terminate_instance() -> None:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Run cone_nf on every row of a parquet file.",
+        description="Run compute_facets on every row of a parquet file.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("input",  help="Source parquet path, glob, or hf:// URL")
@@ -179,7 +189,7 @@ def main():
     ap.add_argument("--verts-col",  default="vertices",
                     help="Name of the vertices column in the source parquet")
     ap.add_argument("--bin",        default=str(DEFAULT_BIN),
-                    help="Path to the cone_nf binary")
+                    help="Path to the compute_facets binary")
     ap.add_argument("--workers",    type=int, default=DEFAULT_WORKERS,
                     help="Number of parallel worker processes")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
@@ -194,8 +204,8 @@ def main():
 
     bin_path = Path(args.bin)
     if not bin_path.exists():
-        sys.exit(f"ERROR: cone_nf binary not found: {bin_path}\n"
-                 f"  Build it with:  cd cone_nf && make")
+        sys.exit(f"ERROR: compute_facets binary not found: {bin_path}\n"
+                 f"  Build it with:  cd compute_facets && make")
 
     # --- Count rows ---
     print(f"Scanning {args.input} …", flush=True)

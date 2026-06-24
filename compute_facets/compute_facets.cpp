@@ -1,38 +1,31 @@
 /*
-  cone_nf.cpp
+  compute_facets.cpp
   -----------
   Compute PALP normal forms of the maximal cones (3D facets + origin) of a 4D
   reflexive lattice polytope, together with the original facet vertices.
 
   Self-contained: only depends on GlobalP.h (the PALP header bundled with the
-  facets module).  No Eigen, no RapidJSON, no MongoDB.
+  compute_facets module).  No Eigen, no RapidJSON, no MongoDB.
 
   Build:
-    g++ -std=c++11 -O2 cone_nf.cpp -o cone_nf
+    g++ -std=c++11 -O2 compute_facets.cpp -o compute_facets
 
   Usage (one JSON object per stdin line):
     echo '{"verts":[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1],[-1,-1,-1,-1]]}' \
-         | ./cone_nf
-    echo '{"POLYID":1,"NVERTS":"{{1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1},{-1,-1,-1,-1}}"}' \
-         | ./cone_nf
+         | ./compute_facets
 
   Accepted input keys:
+    "index"   -- (optional) integer, passed through to output unchanged
     "verts"   -- JSON array of 4D integer coordinate arrays
-    "NVERTS"  -- Mathematica-style string  {{a,b,c,d},{...},...}
-    "POLYID"  -- (optional) integer, passed through to output
 
   Output (one JSON object per line):
     {
-      "POLYID": <int>,              // if present in input
-      "cones": [
-        { "facet_verts": [[...], ...], "cone_nf": [[...], ...] },
-        ...                          // one entry per facet
-      ],
-      "unique_cones": [
-        { "cone_nf": [[...], ...], "multiplicity": N,
-          "example_facet": [[...], ...] },
-        ...                          // deduplicated by normal form
-      ]
+      "index":            <int>,               // passthrough from input 'index' (omitted if input has no 'index')
+      "verts":            [[...], ...],        // original polytope vertices
+      "dual_verts":       [[...], ...],        // vertices of the dual polytope
+      "facets":           [[[...], ...], ...], // 3D facets in dual-vertex order (1:1)
+      "facet_nfs":        [[[...], ...], ...], // GL(3,Z) NF of each 3D facet
+      "maximal_cone_nfs": [[[...], ...], ...]  // GL(4,Z) NF of conv(facet ∪ {0})
     }
 */
 
@@ -40,7 +33,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <map>
 #include <bitset>
 #include <algorithm>
 #include <cstring>
@@ -167,6 +159,158 @@ std::vector<VMatrix> get_facets(PALP::PolyPointList* ppl,
         facets.push_back(fm);
     }
     return facets;
+}
+
+/*
+ * Column-reduce a list of 4D integer vectors to a Z-basis for their span.
+ * Uses the Euclidean (GCD) column reduction algorithm.
+ * After reduction the basis is upper-triangular in pivot-row order:
+ *   basis[k][pivot_rows[j]] = 0  for all j > k.
+ * (Entries above the diagonal, j < k, may be non-zero when the GCD pivot
+ * does not divide the corresponding basis entry.)
+ * coords_in_basis recovers coordinates by forward substitution.
+ */
+static std::vector<IVec> col_basis(std::vector<IVec> cols,
+                                    std::vector<int>&  pivot_rows)
+{
+    const int N = 4;
+    std::vector<IVec> basis;
+    pivot_rows.clear();
+
+    for (int r = 0; r < N && !cols.empty(); ++r) {
+        // Euclidean GCD reduction across all columns in row r
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            // Move the column with smallest non-zero |entry| in row r to front
+            int best = -1;
+            for (int j = 0; j < (int)cols.size(); ++j) {
+                if (cols[j][r] == 0) continue;
+                if (best == -1 || std::abs(cols[j][r]) < std::abs(cols[best][r]))
+                    best = j;
+            }
+            if (best == -1) break;
+            if (best != 0) std::swap(cols[0], cols[best]);
+            // Reduce all other columns modulo cols[0]
+            for (int j = 1; j < (int)cols.size(); ++j) {
+                if (cols[j][r] == 0) continue;
+                long q = cols[j][r] / cols[0][r];
+                if (q == 0) { changed = true; continue; } // will swap next iter
+                for (int i = 0; i < N; ++i) cols[j][i] -= q * cols[0][i];
+                changed = true;
+            }
+        }
+
+        // Find the surviving non-zero column in row r
+        int pivot = -1;
+        for (int j = 0; j < (int)cols.size(); ++j)
+            if (cols[j][r] != 0) { pivot = j; break; }
+        if (pivot == -1) continue;
+
+        // Canonical sign
+        if (cols[pivot][r] < 0)
+            for (int i = 0; i < N; ++i) cols[pivot][i] = -cols[pivot][i];
+
+        // Eliminate row r from all existing basis vectors (RCEF)
+        for (auto& b : basis) {
+            if (b[r] == 0) continue;
+            long q = b[r] / cols[pivot][r];
+            for (int i = 0; i < N; ++i) b[i] -= q * cols[pivot][i];
+        }
+        // Eliminate row r from remaining candidate columns
+        for (int j = 0; j < (int)cols.size(); ++j) {
+            if (j == pivot || cols[j][r] == 0) continue;
+            long q = cols[j][r] / cols[pivot][r];
+            for (int i = 0; i < N; ++i) cols[j][i] -= q * cols[pivot][i];
+        }
+
+        pivot_rows.push_back(r);
+        basis.push_back(cols[pivot]);
+        cols.erase(cols.begin() + pivot);
+    }
+    return basis;
+}
+
+/*
+ * Express a vector d as integer coordinates in the basis produced by col_basis.
+ * The basis is upper-triangular in pivot-row order, so coordinates are
+ * recovered by forward substitution:
+ *   c[k] = (d[pivot_rows[k]] - sum_{j<k} c[j]*basis[j][pivot_rows[k]])
+ *           / basis[k][pivot_rows[k]]
+ */
+static IVec coords_in_basis(const std::vector<IVec>& basis,
+                              const std::vector<int>&  pivot_rows,
+                              const IVec&              d)
+{
+    IVec c((int)basis.size(), 0);
+    for (int k = 0; k < (int)basis.size(); ++k) {
+        long num = d[pivot_rows[k]];
+        for (int j = 0; j < k; ++j)
+            num -= (long)c[j] * basis[j][pivot_rows[k]];
+        c[k] = (int)(num / basis[k][pivot_rows[k]]);
+    }
+    return c;
+}
+
+/*
+ * Compute the GL(3,Z) normal form of a 3D facet embedded in Z^4.
+ *
+ * Algorithm:
+ *  1. Translate so facet_verts[0] is at the origin.
+ *  2. Find a Z-basis for the 3D sublattice spanned by the difference vectors
+ *     (using Euclidean column reduction → RCEF basis).
+ *  3. Express all translated vertices as 3D integer coordinates in that basis.
+ *  4. Compute the PALP GL(3,Z) NF of the 3D polytope.
+ *
+ * The result is canonical as an invariant of the facet as an abstract 3D
+ * lattice polytope (in the lattice it generates).  It is coarser than the
+ * 4D maximal-cone NF: same facet_nf ⟹ abstractly isomorphic 3D polytopes,
+ * but the converse need not hold.
+ */
+VMatrix facet_normal_form(const VMatrix& facet_verts) {
+    const int DIM4 = 4, DIM3 = 3;
+    int n = (int)facet_verts.size();
+    if (n < 2) return {};
+
+    const IVec& v0 = facet_verts[0];
+
+    // Build difference vectors (includes origin = v0 - v0)
+    std::vector<IVec> diffs(n, IVec(DIM4, 0));
+    std::vector<IVec> nonzero_diffs;
+    for (int i = 1; i < n; ++i) {
+        for (int j = 0; j < DIM4; ++j) diffs[i][j] = facet_verts[i][j] - v0[j];
+        nonzero_diffs.push_back(diffs[i]);
+    }
+
+    // Find Z-basis for the 3D sublattice
+    std::vector<int> pivot_rows;
+    std::vector<IVec> basis = col_basis(nonzero_diffs, pivot_rows);
+    if ((int)basis.size() != DIM3) return {}; // degenerate — shouldn't happen
+
+    // Convert all translated vertices to 3D coordinates
+    VMatrix pts3d;
+    for (const IVec& d : diffs)
+        pts3d.push_back(coords_in_basis(basis, pivot_rows, d));
+
+    // Set up PALP for a 3D polytope and compute GL(3,Z) NF
+    PALP::PolyPointList ppl;
+    PALP::VertexNumList vnl;
+    PALP::EqList        eql;
+    PALP::PairMat       vepm;
+    memset(&vepm, 0, sizeof(vepm));
+
+    setup_palp(pts3d, &ppl, &vnl, &eql, vepm, nullptr);
+
+    long pNF[POLY_Dmax][VERT_Nmax];
+    PALP::Make_Poly_NF(&ppl, &vnl, &eql, pNF);
+
+    VMatrix nff;
+    for (int i = 0; i < vnl.nv; ++i) {
+        IVec col(DIM3);
+        for (int j = 0; j < DIM3; ++j) col[j] = (int)pNF[j][i];
+        nff.push_back(col);
+    }
+    return nff;
 }
 
 /*
@@ -316,7 +460,7 @@ int main() {
         if (!vs.empty()) verts = parse_verts(vs);
         if (verts.empty()) { std::cout << line << '\n'; continue; }
 
-        std::string polyid = json_get(line, "POLYID");
+        std::string poly_idx = json_get(line, "index");
         int dim = (int)verts[0].size();
 
         // --- Set up main polytope ---
@@ -329,48 +473,41 @@ int main() {
 
         setup_palp(verts, &ppl, &vnl, &eql, vepm, &finf);
 
-        // --- Facets and cone NFs ---
+        // --- Dual vertices (= facet equation normals, 1:1 with facets) ---
+        VMatrix dual_verts;
+        for (int i = 0; i < eql.ne; ++i) {
+            IVec dv(dim);
+            for (int j = 0; j < dim; ++j) dv[j] = (int)eql.e[i].a[j];
+            dual_verts.push_back(dv);
+        }
+
+        // --- Facets, facet NFs, and maximal cone NFs (in dual-vertex order) ---
         std::vector<VMatrix> facets = get_facets(&ppl, &vnl, &finf, dim);
-
-        // Parallel arrays: facet vertices and their cone NFs
-        std::vector<VMatrix> facet_list, nf_list;
-        // Deduplication: NF JSON string → (nf, multiplicity, example facet)
-        std::map<std::string, std::pair<VMatrix, int>> unique;
-        std::map<std::string, VMatrix>                 unique_ex;
-
+        std::vector<VMatrix> facet_nf_list, maxcone_nf_list;
         for (const VMatrix& fv : facets) {
-            VMatrix nff = cone_normal_form(fv, dim);
-            facet_list.push_back(fv);
-            nf_list.push_back(nff);
-            std::string key = vmat_to_json(nff);
-            if (!unique.count(key)) {
-                unique[key]    = {nff, 1};
-                unique_ex[key] = fv;
-            } else {
-                ++unique[key].second;
-            }
+            facet_nf_list.push_back(facet_normal_form(fv));
+            maxcone_nf_list.push_back(cone_normal_form(fv, dim));
         }
 
         // --- Emit output ---
         std::cout << '{';
-        if (!polyid.empty()) std::cout << "\"POLYID\":" << polyid << ',';
-
-        std::cout << "\"cones\":[";
-        for (int i = 0; i < (int)facet_list.size(); ++i) {
+        if (!poly_idx.empty()) std::cout << "\"index\":" << poly_idx << ',';
+        std::cout << "\"verts\":"      << vmat_to_json(verts)      << ',';
+        std::cout << "\"dual_verts\":" << vmat_to_json(dual_verts) << ',';
+        std::cout << "\"facets\":[";
+        for (int i = 0; i < (int)facets.size(); ++i) {
             if (i) std::cout << ',';
-            std::cout << "{\"facet_verts\":" << vmat_to_json(facet_list[i])
-                      << ",\"cone_nf\":"     << vmat_to_json(nf_list[i]) << '}';
+            std::cout << vmat_to_json(facets[i]);
         }
-
-        std::cout << "],\"unique_cones\":[";
-        bool first = true;
-        for (const auto& kv : unique) {
-            if (!first) std::cout << ',';
-            first = false;
-            std::cout << "{\"cone_nf\":"      << kv.first
-                      << ",\"multiplicity\":" << kv.second.second
-                      << ",\"example_facet\":" << vmat_to_json(unique_ex[kv.first])
-                      << '}';
+        std::cout << "],\"facet_nfs\":[";
+        for (int i = 0; i < (int)facet_nf_list.size(); ++i) {
+            if (i) std::cout << ',';
+            std::cout << vmat_to_json(facet_nf_list[i]);
+        }
+        std::cout << "],\"maximal_cone_nfs\":[";
+        for (int i = 0; i < (int)maxcone_nf_list.size(); ++i) {
+            if (i) std::cout << ',';
+            std::cout << vmat_to_json(maxcone_nf_list[i]);
         }
         std::cout << "]}\n";
         std::cout.flush();
