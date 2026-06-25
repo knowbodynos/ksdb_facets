@@ -100,16 +100,12 @@ int setup_palp(const VMatrix&        verts,
     // Build vertex-equation pairing matrix
     PALP::Make_VEPM(&vlist, vnl, eql, vepm);
 
-    // Fill ppl starting from the true vertices, then Complete_Poly adds all
-    // interior/boundary lattice points.
     ppl->n  = dim;
     ppl->np = vnl->nv;
     for (int i = 0; i < vnl->nv; ++i)
         for (int j = 0; j < dim; ++j)
             ppl->x[i][j] = vlist.x[vnl->v[i]][j];
-    PALP::Complete_Poly(vepm, eql, vnl->nv, ppl);
 
-    // Face incidence (needed for extracting facets of the main polytope)
     if (finf)
         PALP::Make_Incidence(ppl, vnl, eql, finf);
 
@@ -132,9 +128,8 @@ std::vector<VMatrix> get_facets(PALP::PolyPointList* ppl,
         VMatrix fm;
         for (int v = 0; v < vnl->nv; ++v) {
             if (vepm[e][v] == 0) {
-                int vi = vnl->v[v];
                 IVec pt(dim);
-                for (int j = 0; j < dim; ++j) pt[j] = (int)ppl->x[vi][j];
+                for (int j = 0; j < dim; ++j) pt[j] = (int)ppl->x[v][j];
                 fm.push_back(pt);
             }
         }
