@@ -41,6 +41,7 @@ be considerably slowed down.
 #define 		VERT_Nmax	34      /* max number of vertices   */
 #define   		FACE_Nmax	824	/* max number of faces      */
 #define	                SYM_Nmax	1200
+#define			EQUA_Nmax	1280	/* max number of facets     */
 
 #else
 #define   		POINT_Nmax	2000000 
