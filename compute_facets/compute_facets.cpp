@@ -33,7 +33,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <bitset>
 #include <algorithm>
 #include <cstring>
 #include <cassert>
@@ -118,45 +117,28 @@ int setup_palp(const VMatrix&        verts,
 }
 
 /*
- * Decode an INCI bitmask into a sorted list of 0-based vertex indices.
- * Matches the encoding used by PALP's Make_Incidence.
- */
-IVec inci_to_indices(PALP::INCI bitp, int nv) {
-    const int BMAX = 8 * sizeof(unsigned long long);
-    std::bitset<64> bits((unsigned long long)bitp);
-    std::string s = bits.to_string();          // s[0] = MSB
-    IVec inds;
-    for (int i = 0; i < BMAX; ++i) {
-        if (s[i] == '1') {
-            int idx = nv - BMAX + i;
-            if (idx >= 0) inds.push_back(idx);
-        }
-    }
-    std::sort(inds.begin(), inds.end());
-    return inds;
-}
-
-/*
- * Extract all (dim-1)-dimensional faces (facets) from precomputed PALP data.
- * Each returned VMatrix row is a vertex of that facet (original coordinates).
+ * Extract all (dim-1)-dimensional facets directly from the VEPM.
+ * vepm[e][v] == 0 iff vertex v lies on the facet defined by equation e.
+ * This avoids Make_Incidence and its VERT_Nmax constraint on equation count.
  */
 std::vector<VMatrix> get_facets(PALP::PolyPointList* ppl,
                                  PALP::VertexNumList* vnl,
-                                 PALP::FaceInfo*      finf,
-                                 int                  dim)
+                                 PALP::EqList*        eql,
+                                 PALP::PairMat        vepm)
 {
+    int dim = ppl->n;
     std::vector<VMatrix> facets;
-    int nf = finf->nf[dim - 1];
-    for (int i = 0; i < nf; ++i) {
-        IVec inds = inci_to_indices(finf->v[dim - 1][i], vnl->nv);
+    for (int e = 0; e < eql->ne; ++e) {
         VMatrix fm;
-        for (int idx : inds) {
-            int vi = vnl->v[idx];
-            IVec pt(dim);
-            for (int j = 0; j < dim; ++j) pt[j] = (int)ppl->x[vi][j];
-            fm.push_back(pt);
+        for (int v = 0; v < vnl->nv; ++v) {
+            if (vepm[e][v] == 0) {
+                int vi = vnl->v[v];
+                IVec pt(dim);
+                for (int j = 0; j < dim; ++j) pt[j] = (int)ppl->x[vi][j];
+                fm.push_back(pt);
+            }
         }
-        facets.push_back(fm);
+        if (!fm.empty()) facets.push_back(fm);
     }
     return facets;
 }
@@ -468,10 +450,9 @@ int main() {
         PALP::VertexNumList vnl;
         PALP::EqList        eql;
         PALP::PairMat       vepm;
-        PALP::FaceInfo      finf;
         memset(&vepm, 0, sizeof(vepm));
 
-        setup_palp(verts, &ppl, &vnl, &eql, vepm, &finf);
+        setup_palp(verts, &ppl, &vnl, &eql, vepm, nullptr);
 
         // --- Dual vertices (= facet equation normals, 1:1 with facets) ---
         VMatrix dual_verts;
@@ -482,7 +463,7 @@ int main() {
         }
 
         // --- Facets, facet NFs, and maximal cone NFs (in dual-vertex order) ---
-        std::vector<VMatrix> facets = get_facets(&ppl, &vnl, &finf, dim);
+        std::vector<VMatrix> facets = get_facets(&ppl, &vnl, &eql, vepm);
         std::vector<VMatrix> facet_nf_list, maxcone_nf_list;
         for (const VMatrix& fv : facets) {
             facet_nf_list.push_back(facet_normal_form(fv));
