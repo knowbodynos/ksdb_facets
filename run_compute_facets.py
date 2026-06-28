@@ -2,10 +2,11 @@
 """
 run_compute_facets.py
 --------------
-Run compute_facets on every row of a parquet file and write results to a new parquet.
+Run compute_facets on every row of a set of parquet files and write per-file
+results to an output directory.
 
 For each polytope the output contains:
-  index            – original row index in the source parquet (pass-through)
+  index            – row index within the source parquet file (0-based)
   verts            – List(List(Int32)): original 4D polytope vertices
   dual_verts       – List(List(Int32)): vertices of the dual polytope (facet normals);
                      dual_verts[i] is the inner normal of facets[i] (inner product == -1)
@@ -16,22 +17,26 @@ For each polytope the output contains:
   maximal_cone_nfs – List(List(List(Int32))): GL(4,Z) normal form of conv(facets[i] ∪ {0});
                      finer invariant capturing the embedding of the facet in Z^4
 
-Usage:
-    uv run python run_compute_facets.py INPUT OUTPUT [options]
+Each input file produces one output file in OUTPUT_DIR with "-facets" appended to
+the stem (e.g. train-00000-of-00042.parquet → train-00000-of-00042-facets.parquet).
+Output files are compressed with zstd at level 3.
 
-    INPUT   parquet path, glob, or hf:// URL
-    OUTPUT  output parquet path
+Usage:
+    uv run python run_compute_facets.py INPUT OUTPUT_DIR [options]
+
+    INPUT       parquet path, glob, or hf:// URL
+    OUTPUT_DIR  local directory for output parquet files
 
 Examples:
     # Full dataset
-    uv run python run_compute_facets.py \
-        "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \
-        facet_results.parquet
+    uv run python run_compute_facets.py \\
+        "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \\
+        facet_results/
 
     # Quick test on first 1000 rows
-    uv run python run_compute_facets.py --limit 1000 \
-        "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \
-        facet_results_test.parquet
+    uv run python run_compute_facets.py --limit 1000 \\
+        "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \\
+        facet_results_test/
 """
 
 import argparse
@@ -45,8 +50,8 @@ import sys
 import threading
 from pathlib import Path
 
-import polars as pl
 import pyarrow as pa
+import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
@@ -116,7 +121,7 @@ class WorkerPool:
             if item is None:
                 self._task_q.task_done()
                 break
-            idx, verts = item
+            idx, source, verts = item
             try:
                 proc.stdin.write(
                     json.dumps({"index": idx, "verts": verts}, separators=(',', ':')) + '\n'
@@ -127,23 +132,23 @@ class WorkerPool:
                     self._result_q.put(json.loads(line))
                 elif proc.poll() is not None:
                     stderr_out = proc.stderr.read().strip()
-                    self._warn(f"worker crashed on index {idx} ({self._exit_str(proc.returncode)})"
+                    self._warn(f"worker crashed on {source} row {idx} ({self._exit_str(proc.returncode)})"
                                + (f": {stderr_out}" if stderr_out else ""))
                     proc = self._start_proc(bin_path)
             except BrokenPipeError:
                 proc.wait()
                 stderr_out = proc.stderr.read().strip()
-                self._warn(f"broken pipe on index {idx} ({self._exit_str(proc.returncode)})"
+                self._warn(f"broken pipe on {source} row {idx} ({self._exit_str(proc.returncode)})"
                            + (f": {stderr_out}" if stderr_out else ""))
                 proc = self._start_proc(bin_path)
             except Exception as exc:
-                self._warn(f"worker error on index {idx}: {exc}")
+                self._warn(f"worker error on {source} row {idx}: {exc}")
             self._task_q.task_done()
         proc.stdin.close()
         proc.wait()
 
-    def submit(self, idx: int, verts) -> None:
-        self._task_q.put((idx, verts))
+    def submit(self, idx: int, source: str, verts) -> None:
+        self._task_q.put((idx, source, verts))
 
     def join(self) -> list:
         """Block until all submitted tasks finish; return collected results."""
@@ -186,14 +191,15 @@ OUT_SCHEMA = pa.schema([
 # Process one in-memory batch
 # ---------------------------------------------------------------------------
 
-def process_batch(pool, global_indices, verts_list):
+def process_batch(pool, global_indices, verts_list, source: str = ""):
     """
-    global_indices : list of int  (source parquet row indices)
+    global_indices : list of int  (row indices within the current source file)
     verts_list     : list of list-of-list-of-int
+    source         : input file path, included in worker warning messages
     Returns a pyarrow RecordBatch (or None if empty).
     """
     for idx, verts in zip(global_indices, verts_list):
-        pool.submit(idx, verts)
+        pool.submit(idx, source, verts)
 
     all_results = pool.join()
     if not all_results:
@@ -248,11 +254,11 @@ def terminate_instance() -> None:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Run compute_facets on every row of a parquet file.",
+        description="Run compute_facets on every row of a set of parquet files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("input",  help="Source parquet path, glob, or hf:// URL")
-    ap.add_argument("output", help="Output parquet path")
+    ap.add_argument("output", help="Local output directory for result parquet files")
     ap.add_argument("--verts-col",  default="vertices",
                     help="Name of the vertices column in the source parquet")
     ap.add_argument("--bin",        default=str(DEFAULT_BIN),
@@ -262,9 +268,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                     help="Rows loaded into memory per iteration")
     ap.add_argument("--limit",      type=int, default=None,
-                    help="Only process the first N rows (for testing)")
+                    help="Only process the first N rows total (for testing)")
     ap.add_argument("--s3-uri",      type=str, default=None,
-                    help="Upload output to this S3 URI then shut down the instance")
+                    help="Upload each output file to this S3 directory URI, then shut down the instance")
     ap.add_argument("--log",         type=str, default=None,
                     help="Append worker warnings to this file")
     args = ap.parse_args()
@@ -274,46 +280,99 @@ def main():
         sys.exit(f"ERROR: compute_facets binary not found: {bin_path}\n"
                  f"  Build it with:  cd compute_facets && make")
 
-    # --- Count rows ---
-    print(f"Scanning {args.input} …", flush=True)
-    lf = pl.scan_parquet(args.input)
-    total = lf.select(pl.len()).collect().item()
+    # --- Discover input files via pyarrow.dataset (handles globs and hf:// URIs) ---
+    print(f"Listing {args.input} …", flush=True)
+    ds = pads.dataset(args.input, format="parquet")
+    input_files = sorted(ds.files)
+    pa_fs = ds.filesystem
+    if not input_files:
+        sys.exit(f"ERROR: no parquet files found: {args.input}")
+
+    # --- Count rows from parquet footers (reads only footer metadata, not data) ---
+    file_row_counts = []
+    for path in input_files:
+        with pa_fs.open_input_file(path) as f:
+            file_row_counts.append(pq.ParquetFile(f).metadata.num_rows)
+    total = sum(file_row_counts)
     if args.limit:
         total = min(total, args.limit)
-    print(f"  {total:,} rows to process  |  {args.workers} workers  |  "
-          f"batch={args.batch_size}", flush=True)
 
-    # --- Streaming write ---
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = pq.ParquetWriter(str(out_path), OUT_SCHEMA, compression="snappy")
+    print(f"  {len(input_files)} file(s)  |  {total:,} rows  |  "
+          f"{args.workers} workers  |  batch={args.batch_size}", flush=True)
 
-    n_written = 0
-    with WorkerPool(str(bin_path), args.workers, log_path=args.log) as pool:
-        with tqdm(total=total, unit="poly", smoothing=0.05) as bar:
-            offset = 0
-            while offset < total:
-                batch_n = min(args.batch_size, total - offset)
-                df = lf.slice(offset, batch_n).collect()
-                global_indices = list(range(offset, offset + len(df)))
-                verts_list = df[args.verts_col].to_list()
+    # --- Output directory ---
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-                rb = process_batch(pool, global_indices, verts_list)
-                if rb is not None:
-                    writer.write_batch(rb)
-                    n_written += rb.num_rows
+    # --- Stream and process ---
+    n_total_written = 0
+    rows_remaining  = total if args.limit else None
 
-                bar.update(len(df))
-                offset += len(df)
+    try:
+        with WorkerPool(str(bin_path), args.workers, log_path=args.log) as pool:
+            with tqdm(total=total, unit="poly", smoothing=0.05) as bar:
+                for path, file_nrows in zip(input_files, file_row_counts):
+                    if rows_remaining is not None and rows_remaining <= 0:
+                        break
 
-    writer.close()
-    print(f"\nWrote {n_written:,} rows → {out_path}", flush=True)
+                    file_limit = (
+                        min(file_nrows, rows_remaining)
+                        if rows_remaining is not None
+                        else file_nrows
+                    )
+                    stem, ext = os.path.splitext(os.path.basename(path))
+                    out_path = out_dir / f"{stem}-facets{ext}"
+                    writer = pq.ParquetWriter(
+                        str(out_path), OUT_SCHEMA,
+                        compression="zstd", compression_level=3,
+                    )
+                    n_written  = 0
+                    row_offset = 0
 
-    if args.s3_uri is not None:
-        try:
-            upload_to_s3(str(out_path), args.s3_uri)
-            print(f"Uploaded {out_path} to {args.s3_uri}")
-        finally:
+                    with pa_fs.open_input_file(path) as f:
+                        pf = pq.ParquetFile(f)
+                        for batch in pf.iter_batches(
+                                batch_size=args.batch_size,
+                                columns=[args.verts_col]):
+                            if row_offset >= file_limit:
+                                break
+                            take = min(batch.num_rows, file_limit - row_offset)
+                            if take < batch.num_rows:
+                                batch = batch.slice(0, take)
+
+                            indices    = list(range(row_offset, row_offset + take))
+                            verts_list = batch.column(args.verts_col).to_pylist()
+
+                            rb = process_batch(pool, indices, verts_list, source=path)
+                            if rb is not None:
+                                writer.write_batch(rb)
+                                n_written += rb.num_rows
+
+                            bar.update(take)
+                            row_offset += take
+                            if rows_remaining is not None:
+                                rows_remaining -= take
+
+                    writer.close()
+                    n_total_written += n_written
+                    tqdm.write(f"  {out_path.name}: wrote {n_written:,} rows")
+
+                    if args.s3_uri is not None:
+                        dest = args.s3_uri.rstrip("/") + "/" + out_path.name
+                        upload_to_s3(str(out_path), dest)
+                        tqdm.write(f"  Uploaded → {dest}")
+
+        print(f"\nDone. Wrote {n_total_written:,} rows total → {out_dir}", flush=True)
+
+    finally:
+        if args.s3_uri is not None:
+            if args.log is not None:
+                log_dest = args.s3_uri.rstrip("/") + "/" + os.path.basename(args.log)
+                try:
+                    upload_to_s3(args.log, log_dest)
+                    print(f"Uploaded log → {log_dest}", flush=True)
+                except Exception as exc:
+                    print(f"[warn] Failed to upload log: {exc}", file=sys.stderr)
             terminate_instance()
 
 
