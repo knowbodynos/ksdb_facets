@@ -179,8 +179,8 @@ class WorkerPool:
 
 OUT_SCHEMA = pa.schema([
     pa.field("index",            pa.int64()),
-    pa.field("verts",            pa.list_(pa.list_(pa.int32()))),
-    pa.field("dual_verts",       pa.list_(pa.list_(pa.int32()))),
+    pa.field("vertices",         pa.list_(pa.list_(pa.int32()))),
+    pa.field("dual_vertices",    pa.list_(pa.list_(pa.int32()))),
     pa.field("facets",           pa.list_(pa.list_(pa.list_(pa.int32())))),
     pa.field("facet_nfs",        pa.list_(pa.list_(pa.list_(pa.int32())))),
     pa.field("maximal_cone_nfs", pa.list_(pa.list_(pa.list_(pa.int32())))),
@@ -208,28 +208,28 @@ def process_batch(pool, global_indices, verts_list, source: str = ""):
     all_results.sort(key=lambda r: r["index"])
 
     out_index        = []
-    out_verts        = []
-    out_dual_verts   = []
+    out_vertices     = []
+    out_dual_vertices = []
     out_facets       = []
     out_facet_nfs    = []
     out_maxcone_nfs  = []
 
     for r in all_results:
         out_index.append(r["index"])
-        out_verts.append(r["verts"])
-        out_dual_verts.append(r["dual_verts"])
+        out_vertices.append(r["verts"])
+        out_dual_vertices.append(r["dual_verts"])
         out_facets.append(r["facets"])
         out_facet_nfs.append(r["facet_nfs"])
         out_maxcone_nfs.append(r["maximal_cone_nfs"])
 
     return pa.record_batch(
         [
-            pa.array(out_index,       type=pa.int64()),
-            pa.array(out_verts,       type=pa.list_(pa.list_(pa.int32()))),
-            pa.array(out_dual_verts,  type=pa.list_(pa.list_(pa.int32()))),
-            pa.array(out_facets,      type=pa.list_(pa.list_(pa.list_(pa.int32())))),
-            pa.array(out_facet_nfs,   type=pa.list_(pa.list_(pa.list_(pa.int32())))),
-            pa.array(out_maxcone_nfs, type=pa.list_(pa.list_(pa.list_(pa.int32())))),
+            pa.array(out_index,         type=pa.int64()),
+            pa.array(out_vertices,      type=pa.list_(pa.list_(pa.int32()))),
+            pa.array(out_dual_vertices, type=pa.list_(pa.list_(pa.int32()))),
+            pa.array(out_facets,        type=pa.list_(pa.list_(pa.list_(pa.int32())))),
+            pa.array(out_facet_nfs,     type=pa.list_(pa.list_(pa.list_(pa.int32())))),
+            pa.array(out_maxcone_nfs,   type=pa.list_(pa.list_(pa.list_(pa.int32())))),
         ],
         schema=OUT_SCHEMA,
     )

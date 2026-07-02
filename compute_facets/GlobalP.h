@@ -38,7 +38,7 @@ be considerably slowed down.
 
 #elif	(POLY_Dmax == 4)
 #define   		POINT_Nmax	700	/* max number of points	    */
-#define 		VERT_Nmax	34      /* max number of vertices   */
+#define 		VERT_Nmax	64      /* max number of vertices   */
 #define   		FACE_Nmax	824	/* max number of faces      */
 #define	                SYM_Nmax	1200
 #define			EQUA_Nmax	1280	/* max number of facets     */
