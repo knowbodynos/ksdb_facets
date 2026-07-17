@@ -39,7 +39,7 @@ def list_parquets(s3, path, pattern):
     infos = s3.get_file_info(pafs.FileSelector(path, recursive=True))
     result = {}
     for info in infos:
-        if not info.path.endswith(".parquet"):
+        if info.type != pafs.FileType.File or not info.path.endswith(".parquet"):
             continue
         m = pattern.search(info.base_name)
         if m:

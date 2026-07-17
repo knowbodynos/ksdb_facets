@@ -40,7 +40,10 @@ def get_fs_and_path(path, region):
 
 def list_parquets(fs, path):
     infos = fs.get_file_info(pafs.FileSelector(path, recursive=True))
-    return [info.path for info in infos if info.path.endswith(".parquet")]
+    return [
+        info.path for info in infos
+        if info.type == pafs.FileType.File and info.path.endswith(".parquet")
+    ]
 
 
 def main():

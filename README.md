@@ -15,6 +15,7 @@ For each polytope, the output records:
 | `scripts/run_compute_facets.py` | Python | Drives the binary over a set of Parquet files with a persistent parallel worker pool |
 | `scripts/find_missing.py` | Python | Compares two S3 prefixes and reports files/rows present in one but absent in the other |
 | `scripts/rename_column.py` | Python | Renames a Parquet column in-place across all files under an S3 prefix |
+| `scripts/count_unique_nfs.py` | Python | Counts unique GL(3,Z) and GL(4,Z) normal forms across all output Parquet files |
 
 ## Requirements
 
@@ -72,6 +73,51 @@ uv run python scripts/run_compute_facets.py \
 
 When `--s3-uri` is set, each output file is uploaded to the S3 directory as it completes, the log file is uploaded before shutdown, and the instance terminates itself via `sudo shutdown -h now`. The EC2 instance role needs `s3:PutObject` on the output bucket.
 
+### find_missing.py
+
+Reports which files and rows from one S3 prefix are absent in another, matched by a key column.
+
+```bash
+uv run python scripts/find_missing.py \
+    s3://my-bucket/source-prefix/ \
+    s3://my-bucket/derived-prefix/
+```
+
+Files are paired by a capture group in each path's filename regex. Entirely absent files and partially missing rows are both reported.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--key-col NAME` | `vertices` | Column used to match rows across files |
+| `--re-1 REGEX` | `polytopes-4d-0*(\d+)-vertices\.parquet$` | Regex (one capture group) applied to path-1 filenames |
+| `--re-2 REGEX` | `4d-polytope-facets-(\d+)-vertices\.parquet$` | Regex (one capture group) applied to path-2 filenames |
+| `--region NAME` | `us-east-2` | AWS region |
+
+### rename_column.py
+
+Renames a column in every Parquet file under an S3 prefix, in-place. Streams one row group at a time; handles files larger than 5 GB via multipart copy.
+
+```bash
+uv run python scripts/rename_column.py s3://my-bucket/prefix/ old_col new_col
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--region NAME` | `us-east-2` | AWS region |
+| `--dry-run` | — | List files that would be changed without writing |
+
+### count_unique_nfs.py
+
+Counts unique GL(3,Z) facet normal forms and GL(4,Z) maximal cone normal forms across all output Parquet files. Writes a summary to `INFO.md` in the same location.
+
+```bash
+uv run python scripts/count_unique_nfs.py facet_results/
+uv run python scripts/count_unique_nfs.py s3://my-bucket/prefix/
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--region NAME` | `us-east-2` | AWS region (S3 only) |
+
 ### Binary directly
 
 The binary reads one JSON object per line from stdin and writes one per line to stdout:
@@ -101,8 +147,8 @@ Both `"verts"` (JSON array) and `"NVERTS"` (Mathematica-style `{{...}}` string) 
 | Column | Type | Description |
 |--------|------|-------------|
 | `index` | `int64` | Row index within the source Parquet file (0-based) |
-| `verts` | `list<list<int32>>` | Original 4D polytope vertices |
-| `dual_verts` | `list<list<int32>>` | Facet inner normals; `dual_verts[i]` corresponds to `facets[i]` |
+| `vertices` | `list<list<int32>>` | Original 4D polytope vertices |
+| `dual_vertices` | `list<list<int32>>` | Facet inner normals; `dual_vertices[i]` is the inner normal of `facets[i]` |
 | `facets` | `list<list<list<int32>>>` | Vertex coordinates of each 3D facet |
 | `facet_nfs` | `list<list<list<int32>>>` | GL(3,Z) normal form of each facet as an abstract 3D lattice polytope |
 | `maximal_cone_nfs` | `list<list<list<int32>>>` | GL(4,Z) normal form of `conv(facets[i] ∪ {0})` |
