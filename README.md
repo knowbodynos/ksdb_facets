@@ -12,7 +12,9 @@ For each polytope, the output records:
 | Path | Language | Role |
 |------|----------|------|
 | `compute_facets/compute_facets.cpp` | C++ | Core binary — reads one JSON object per stdin line, emits one per stdout line |
-| `run_compute_facets.py` | Python | Drives the binary over a set of Parquet files with a persistent parallel worker pool |
+| `scripts/run_compute_facets.py` | Python | Drives the binary over a set of Parquet files with a persistent parallel worker pool |
+| `scripts/find_missing.py` | Python | Compares two S3 prefixes and reports files/rows present in one but absent in the other |
+| `scripts/rename_column.py` | Python | Renames a Parquet column in-place across all files under an S3 prefix |
 
 ## Requirements
 
@@ -34,12 +36,12 @@ This produces `compute_facets/compute_facets`.
 
 ```bash
 # Full Kreuzer-Skarke dataset from HuggingFace
-uv run python run_compute_facets.py \
+uv run python scripts/run_compute_facets.py \
     "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \
     facet_results/
 
 # Quick test on the first 1000 polytopes
-uv run python run_compute_facets.py --limit 1000 \
+uv run python scripts/run_compute_facets.py --limit 1000 \
     "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \
     facet_results_test/
 ```
@@ -61,7 +63,7 @@ Each input file produces one output file in the output directory with `-facets` 
 ### EC2 spot instance use
 
 ```bash
-uv run python run_compute_facets.py \
+uv run python scripts/run_compute_facets.py \
     "hf://datasets/calabi-yau-data/polytopes-4d/*.parquet" \
     /tmp/facet_results/ \
     --s3-uri s3://my-bucket/facet_results \

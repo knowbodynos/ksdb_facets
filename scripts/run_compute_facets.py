@@ -58,7 +58,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_BIN        = Path(__file__).resolve().parent / "compute_facets" / "compute_facets"
+DEFAULT_BIN        = Path(__file__).resolve().parent.parent / "compute_facets" / "compute_facets"
 DEFAULT_BATCH_SIZE = 10_000   # rows read into memory per iteration
 DEFAULT_WORKERS    = os.cpu_count() or 4
 
