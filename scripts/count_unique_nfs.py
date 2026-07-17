@@ -15,27 +15,33 @@ Examples:
 
 import argparse
 import datetime
+import os
+import struct
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-DEFAULT_REGION = "us-east-2"
-FACET_NF_COL   = "facet_nfs"
-CONE_NF_COL    = "maximal_cone_nfs"
+DEFAULT_REGION  = "us-east-2"
+DEFAULT_WORKERS = os.cpu_count() or 1
+FACET_NF_COL    = "facet_nfs"
+CONE_NF_COL     = "maximal_cone_nfs"
 
 
-def to_hashable(v):
-    if isinstance(v, list):
-        return tuple(to_hashable(x) for x in v)
-    return v
+def nf_to_key(nf):
+    """Pack a normal form (list of lists of int) into a bytes key for hashing."""
+    rows = len(nf)
+    cols = len(nf[0]) if rows else 0
+    flat = [v for row in nf for v in row]
+    return struct.pack(f'HH{len(flat)}i', rows, cols, *flat)
 
 
 def get_fs_and_path(path, region):
     if path.startswith("s3://"):
-        return pafs.S3FileSystem(region=region), path.removeprefix("s3://").rstrip("/")
-    return pafs.LocalFileSystem(), path.rstrip("/")
+        return pafs.S3FileSystem(region=region), path.removeprefix("s3://").rstrip("/"), True
+    return pafs.LocalFileSystem(), path.rstrip("/"), False
 
 
 def list_parquets(fs, path):
@@ -46,63 +52,80 @@ def list_parquets(fs, path):
     ]
 
 
+def _process_file(args):
+    """Worker: read one file, return (facet_key_set, cone_key_set, n_polys, n_facets)."""
+    fpath, is_s3, region = args
+    fs = pafs.S3FileSystem(region=region) if is_s3 else pafs.LocalFileSystem()
+
+    facet_keys = set()
+    cone_keys  = set()
+    n_polys    = 0
+    n_facets   = 0
+
+    with fs.open_input_file(fpath) as f:
+        pf = pq.ParquetFile(f)
+        cols = [c for c in [FACET_NF_COL, CONE_NF_COL] if c in pf.schema_arrow.names]
+        if not cols:
+            return facet_keys, cone_keys, 0, 0
+
+        for i in range(pf.metadata.num_row_groups):
+            batch = pf.read_row_group(i, columns=cols)
+            n_polys += batch.num_rows
+
+            if FACET_NF_COL in cols:
+                for row_nfs in batch.column(FACET_NF_COL).to_pylist():
+                    n_facets += len(row_nfs)
+                    for nf in row_nfs:
+                        facet_keys.add(nf_to_key(nf))
+
+            if CONE_NF_COL in cols:
+                for row_nfs in batch.column(CONE_NF_COL).to_pylist():
+                    if FACET_NF_COL not in cols:
+                        n_facets += len(row_nfs)
+                    for nf in row_nfs:
+                        cone_keys.add(nf_to_key(nf))
+
+    return facet_keys, cone_keys, n_polys, n_facets
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Count unique GL(3,Z) and GL(4,Z) normal forms across parquet files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("path", help="Local directory or s3://bucket/prefix/ of output parquet files")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help="Number of parallel worker processes")
     ap.add_argument("--region", default=DEFAULT_REGION, help="AWS region (S3 only)")
     args = ap.parse_args()
 
-    fs, path = get_fs_and_path(args.path, args.region)
+    fs, path, is_s3 = get_fs_and_path(args.path, args.region)
 
     print("Listing files…", flush=True)
     files = list_parquets(fs, path)
     if not files:
         sys.exit(f"No parquet files found under {args.path}")
-    print(f"  {len(files)} file(s)", flush=True)
+    print(f"  {len(files)} file(s)  |  {args.workers} worker(s)", flush=True)
 
-    print("Reading file metadata…", flush=True)
-    file_meta = []
-    for fpath in files:
-        with fs.open_input_file(fpath) as f:
-            file_meta.append((fpath, pq.ParquetFile(f).metadata))
-    total_rgs = sum(m.num_row_groups for _, m in file_meta)
+    facet_nf_set = set()
+    cone_nf_set  = set()
+    total_facets = 0
+    total_polys  = 0
 
-    facet_nf_set  = set()
-    cone_nf_set   = set()
-    total_facets  = 0
-    total_polys   = 0
+    worker_args = [(fpath, is_s3, args.region) for fpath in files]
 
-    with tqdm(total=total_rgs, unit="rg") as bar:
-        for fpath, _ in file_meta:
-            bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
-            with fs.open_input_file(fpath) as f:
-                pf = pq.ParquetFile(f)
-                schema_names = pf.schema_arrow.names
-                cols = [c for c in [FACET_NF_COL, CONE_NF_COL] if c in schema_names]
-                if not cols:
-                    bar.update(pf.metadata.num_row_groups)
-                    continue
-                for i in range(pf.metadata.num_row_groups):
-                    batch = pf.read_row_group(i, columns=cols)
-                    total_polys += batch.num_rows
-
-                    if FACET_NF_COL in cols:
-                        for row_nfs in batch.column(FACET_NF_COL).to_pylist():
-                            total_facets += len(row_nfs)
-                            for nf in row_nfs:
-                                facet_nf_set.add(to_hashable(nf))
-
-                    if CONE_NF_COL in cols:
-                        for row_nfs in batch.column(CONE_NF_COL).to_pylist():
-                            if FACET_NF_COL not in cols:
-                                total_facets += len(row_nfs)
-                            for nf in row_nfs:
-                                cone_nf_set.add(to_hashable(nf))
-
-                    bar.update(1)
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(_process_file, arg): arg[0] for arg in worker_args}
+        with tqdm(total=len(files), unit="file") as bar:
+            for future in as_completed(futures):
+                fpath = futures[future]
+                bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
+                facet_keys, cone_keys, n_polys, n_facets = future.result()
+                facet_nf_set.update(facet_keys)
+                cone_nf_set.update(cone_keys)
+                total_polys  += n_polys
+                total_facets += n_facets
+                bar.update(1)
 
     n_facet_nfs = len(facet_nf_set)
     n_cone_nfs  = len(cone_nf_set)
