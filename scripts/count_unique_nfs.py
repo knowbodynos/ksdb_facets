@@ -10,7 +10,7 @@ Usage:
 
 Examples:
     uv run python count_unique_nfs.py facet_results/
-    uv run python count_unique_nfs.py s3://toriccy/4d-polytope-facets/
+    uv run python count_unique_nfs.py s3://toriccy/shared/4d-polytope-facets/
 """
 
 import argparse

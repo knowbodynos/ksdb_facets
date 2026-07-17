@@ -9,7 +9,7 @@ Usage:
     uv run python rename_column.py s3://bucket/prefix/ OLD_COL NEW_COL
 
 Example:
-    uv run python rename_column.py s3://toriccy/4d-polytope-facets/ verts vertices
+    uv run python rename_column.py s3://toriccy/shared/4d-polytope-facets/ verts vertices
 """
 
 import argparse

@@ -14,7 +14,7 @@ Usage:
 Example:
     uv run python find_missing.py \\
         s3://toriccy/datasets--calabi-yau-data--polytopes-4d/ \\
-        s3://toriccy/4d-polytope-facets/
+        s3://toriccy/shared/4d-polytope-facets/
 """
 
 import argparse
