@@ -16,8 +16,10 @@ Examples:
 import argparse
 import datetime
 import os
+import pickle
 import struct
 import sys
+import tempfile
 from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
 
 import pyarrow.fs as pafs
@@ -53,8 +55,8 @@ def list_parquets(fs, path):
 
 
 def _process_file(args):
-    """Worker: read one file, return (facet_key_set, cone_key_set, n_polys, n_facets)."""
-    fpath, is_s3, region = args
+    """Worker: read one file, write result sets to a temp file, return the path."""
+    fpath, is_s3, region, tmp_dir = args
     fs = pafs.S3FileSystem(region=region) if is_s3 else pafs.LocalFileSystem()
 
     facet_keys = set()
@@ -66,7 +68,7 @@ def _process_file(args):
         pf = pq.ParquetFile(f)
         cols = [c for c in [FACET_NF_COL, CONE_NF_COL] if c in pf.schema_arrow.names]
         if not cols:
-            return facet_keys, cone_keys, 0, 0
+            return None, 0, 0
 
         for i in range(pf.metadata.num_row_groups):
             batch = pf.read_row_group(i, columns=cols)
@@ -85,7 +87,11 @@ def _process_file(args):
                     for nf in row_nfs:
                         cone_keys.add(nf_to_key(nf))
 
-    return facet_keys, cone_keys, n_polys, n_facets
+    result_path = os.path.join(tmp_dir, os.path.basename(fpath) + ".result")
+    with open(result_path, "wb") as out:
+        pickle.dump((facet_keys, cone_keys), out, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return result_path, n_polys, n_facets
 
 
 def main():
@@ -112,42 +118,54 @@ def main():
     total_facets = 0
     total_polys  = 0
 
-    worker_args = [(fpath, is_s3, args.region) for fpath in files]
     done = set()
 
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(_process_file, arg): arg[0] for arg in worker_args}
-        with tqdm(total=len(files), unit="file") as bar:
-            for future in as_completed(futures):
-                fpath = futures[future]
-                bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
-                try:
-                    facet_keys, cone_keys, n_polys, n_facets = future.result()
-                    facet_nf_set.update(facet_keys)
-                    cone_nf_set.update(cone_keys)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        worker_args = [(fpath, is_s3, args.region, tmp_dir) for fpath in files]
+
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(_process_file, arg): arg[0] for arg in worker_args}
+            with tqdm(total=len(files), unit="file") as bar:
+                for future in as_completed(futures):
+                    fpath = futures[future]
+                    bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
+                    try:
+                        result_path, n_polys, n_facets = future.result()
+                        if result_path:
+                            with open(result_path, "rb") as f:
+                                facet_keys, cone_keys = pickle.load(f)
+                            os.unlink(result_path)
+                            facet_nf_set.update(facet_keys)
+                            cone_nf_set.update(cone_keys)
+                            del facet_keys, cone_keys
+                        total_polys  += n_polys
+                        total_facets += n_facets
+                        done.add(fpath)
+                        bar.update(1)
+                    except BrokenExecutor:
+                        tqdm.write("\n[warn] Worker killed (likely OOM) — falling back to serial for remaining files.")
+                        break
+                    except Exception as exc:
+                        tqdm.write(f"\n[warn] {fpath.rsplit('/', 1)[-1]}: {exc}")
+                        bar.update(1)
+
+        remaining = [fpath for fpath in files if fpath not in done]
+        if remaining:
+            tqdm.write(f"Processing {len(remaining)} remaining file(s) serially…")
+            with tqdm(total=len(remaining), unit="file") as bar:
+                for fpath in remaining:
+                    bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
+                    result_path, n_polys, n_facets = _process_file((fpath, is_s3, args.region, tmp_dir))
+                    if result_path:
+                        with open(result_path, "rb") as f:
+                            facet_keys, cone_keys = pickle.load(f)
+                        os.unlink(result_path)
+                        facet_nf_set.update(facet_keys)
+                        cone_nf_set.update(cone_keys)
+                        del facet_keys, cone_keys
                     total_polys  += n_polys
                     total_facets += n_facets
-                    done.add(fpath)
                     bar.update(1)
-                except BrokenExecutor:
-                    tqdm.write("\n[warn] Worker killed (likely OOM) — falling back to serial for remaining files.")
-                    break
-                except Exception as exc:
-                    tqdm.write(f"\n[warn] {fpath.rsplit('/', 1)[-1]}: {exc}")
-                    bar.update(1)
-
-    remaining = [fpath for fpath in files if fpath not in done]
-    if remaining:
-        tqdm.write(f"Processing {len(remaining)} remaining file(s) serially…")
-        with tqdm(total=len(remaining), unit="file") as bar:
-            for fpath in remaining:
-                bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
-                facet_keys, cone_keys, n_polys, n_facets = _process_file((fpath, is_s3, args.region))
-                facet_nf_set.update(facet_keys)
-                cone_nf_set.update(cone_keys)
-                total_polys  += n_polys
-                total_facets += n_facets
-                bar.update(1)
 
     n_facet_nfs = len(facet_nf_set)
     n_cone_nfs  = len(cone_nf_set)
