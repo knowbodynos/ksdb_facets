@@ -18,7 +18,7 @@ import datetime
 import os
 import struct
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
 
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
@@ -113,6 +113,7 @@ def main():
     total_polys  = 0
 
     worker_args = [(fpath, is_s3, args.region) for fpath in files]
+    done = set()
 
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = {executor.submit(_process_file, arg): arg[0] for arg in worker_args}
@@ -120,7 +121,28 @@ def main():
             for future in as_completed(futures):
                 fpath = futures[future]
                 bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
-                facet_keys, cone_keys, n_polys, n_facets = future.result()
+                try:
+                    facet_keys, cone_keys, n_polys, n_facets = future.result()
+                    facet_nf_set.update(facet_keys)
+                    cone_nf_set.update(cone_keys)
+                    total_polys  += n_polys
+                    total_facets += n_facets
+                    done.add(fpath)
+                    bar.update(1)
+                except BrokenExecutor:
+                    tqdm.write("\n[warn] Worker killed (likely OOM) — falling back to serial for remaining files.")
+                    break
+                except Exception as exc:
+                    tqdm.write(f"\n[warn] {fpath.rsplit('/', 1)[-1]}: {exc}")
+                    bar.update(1)
+
+    remaining = [fpath for fpath in files if fpath not in done]
+    if remaining:
+        tqdm.write(f"Processing {len(remaining)} remaining file(s) serially…")
+        with tqdm(total=len(remaining), unit="file") as bar:
+            for fpath in remaining:
+                bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
+                facet_keys, cone_keys, n_polys, n_facets = _process_file((fpath, is_s3, args.region))
                 facet_nf_set.update(facet_keys)
                 cone_nf_set.update(cone_keys)
                 total_polys  += n_polys
