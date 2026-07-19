@@ -23,6 +23,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 from tqdm import tqdm
@@ -31,14 +32,6 @@ DEFAULT_REGION  = "us-east-2"
 DEFAULT_WORKERS = os.cpu_count() or 1
 FACET_NF_COL    = "facet_nfs"
 CONE_NF_COL     = "maximal_cone_nfs"
-
-
-def nf_to_key(nf):
-    rows = len(nf)
-    cols = len(nf[0]) if rows else 0
-    flat = [v for row in nf for v in row]
-    data = struct.pack(f'HH{len(flat)}i', rows, cols, *flat)
-    return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), 'little')
 
 
 def get_fs_and_path(path, region):
@@ -61,12 +54,63 @@ def _read_rg_count(args):
         return fpath, pq.ParquetFile(f).metadata.num_row_groups
 
 
+def rss_gb():
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform != "darwin":  # Linux reports KB; macOS reports bytes
+        rss *= 1024
+    return rss / 1e9
+
+
+def _hash_nf_column(col):
+    """
+    Hash all NF matrices in a List(List(List(Int32))) column.
+
+    Accesses Arrow buffers directly to avoid materialising Python int objects.
+    col layout (after combine_chunks):
+      col            ListArray — one entry per polytope
+      col.values     ListArray — one entry per NF matrix
+      col.values.values          ListArray — one entry per row of NF
+      col.values.values.values   Int32Array — flat element data
+
+    Returns (unique_hashes: np.ndarray[uint64], n_nfs: int).
+    """
+    if isinstance(col, pa.ChunkedArray):
+        col = col.combine_chunks()
+    if len(col) == 0:
+        return np.empty(0, dtype=np.uint64), 0
+
+    per_nf  = col.values        # ListArray(List(Int32)): one entry per NF
+    per_row = per_nf.values     # ListArray(Int32):       one entry per row
+
+    # Convert offset arrays to numpy without creating Python int objects
+    nf_offsets  = per_nf.offsets.to_numpy(zero_copy_only=False)   # (n_nfs + 1,)
+    row_offsets = per_row.offsets.to_numpy(zero_copy_only=False)  # (n_rows + 1,)
+    flat_ints   = per_row.values.to_numpy(zero_copy_only=False)   # (n_ints,)
+
+    n_nfs = len(per_nf)
+    hashes = np.empty(n_nfs, dtype=np.uint64)
+
+    for i in range(n_nfs):
+        r0 = int(nf_offsets[i])
+        r1 = int(nf_offsets[i + 1])
+        n_rows = r1 - r0
+        if n_rows == 0:
+            hashes[i] = 0
+            continue
+        v0 = int(row_offsets[r0])
+        v1 = int(row_offsets[r1])
+        n_cols = (v1 - v0) // n_rows
+        raw = struct.pack('HH', n_rows, n_cols) + flat_ints[v0:v1].tobytes()
+        hashes[i] = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), 'little')
+
+    return np.unique(hashes), n_nfs
+
+
 def _process_file(fpath, fs, progress_callback=None):
-    """Read one parquet file; return deduplicated uint64 hash arrays + counts."""
-    facet_hashes = []
-    cone_hashes  = []
-    n_polys      = 0
-    n_facets     = 0
+    facet_hash_chunks = []
+    cone_hash_chunks  = []
+    n_polys  = 0
+    n_facets = 0
 
     with fs.open_input_file(fpath) as f:
         pf = pq.ParquetFile(f)
@@ -82,34 +126,23 @@ def _process_file(fpath, fs, progress_callback=None):
             n_polys += batch.num_rows
 
             if FACET_NF_COL in cols:
-                for row_nfs in batch.column(FACET_NF_COL).to_pylist():
-                    n_facets += len(row_nfs)
-                    for nf in row_nfs:
-                        facet_hashes.append(nf_to_key(nf))
+                h, cnt = _hash_nf_column(batch.column(FACET_NF_COL))
+                facet_hash_chunks.append(h)
+                n_facets += cnt
 
             if CONE_NF_COL in cols:
-                for row_nfs in batch.column(CONE_NF_COL).to_pylist():
-                    if FACET_NF_COL not in cols:
-                        n_facets += len(row_nfs)
-                    for nf in row_nfs:
-                        cone_hashes.append(nf_to_key(nf))
+                h, cnt = _hash_nf_column(batch.column(CONE_NF_COL))
+                cone_hash_chunks.append(h)
+                if FACET_NF_COL not in cols:
+                    n_facets += cnt
 
             if progress_callback:
                 progress_callback()
 
-    return (
-        np.unique(np.array(facet_hashes, dtype=np.uint64)),
-        np.unique(np.array(cone_hashes,  dtype=np.uint64)),
-        n_polys,
-        n_facets,
-    )
+    facet_arr = np.unique(np.concatenate(facet_hash_chunks)) if facet_hash_chunks else np.empty(0, dtype=np.uint64)
+    cone_arr  = np.unique(np.concatenate(cone_hash_chunks))  if cone_hash_chunks  else np.empty(0, dtype=np.uint64)
 
-
-def rss_gb():
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform != "darwin":  # Linux reports KB; macOS reports bytes
-        rss *= 1024
-    return rss / 1e9
+    return facet_arr, cone_arr, n_polys, n_facets
 
 
 def main():
@@ -145,9 +178,14 @@ def main():
     total_facets = 0
     total_polys  = 0
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(_process_file, fpath, fs): fpath for fpath in files}
-        with tqdm(total=total_rgs, unit="rg") as bar:
+    # Workers advance the bar per row group via progress_callback; the main
+    # thread does not call bar.update so row groups are never double-counted.
+    with tqdm(total=total_rgs, unit="rg") as bar:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(_process_file, fpath, fs, bar.update): fpath
+                for fpath in files
+            }
             for future in as_completed(futures):
                 fpath = futures[future]
                 bar.set_postfix_str(fpath.rsplit("/", 1)[-1], refresh=False)
@@ -158,11 +196,9 @@ def main():
                     del facet_arr, cone_arr
                     total_polys  += n_polys
                     total_facets += n_facets
-                    bar.update(rg_counts.get(fpath, 1))
                     bar.set_postfix(rss=f"{rss_gb():.2f}GB", refresh=False)
                 except Exception as exc:
                     tqdm.write(f"[warn] {fpath.rsplit('/', 1)[-1]}: {exc}")
-                    bar.update(rg_counts.get(fpath, 1))
 
     n_facet_nfs = len(facet_nf_arr)
     n_cone_nfs  = len(cone_nf_arr)
