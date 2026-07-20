@@ -225,7 +225,7 @@ Generated: {timestamp}
 | Unique facet NFs (GL(3,Z)) | {n_facet_nfs:,} |
 | Unique maximal cone NFs (GL(4,Z)) | {n_cone_nfs:,} |
 """
-    with fs.open_output_stream(info_path) as out:
+    with fs.open_output_stream(info_path, metadata={"Content-Type": "text/markdown"}) as out:
         out.write(info_md.encode())
 
     prefix = "s3://" if args.path.startswith("s3://") else ""
